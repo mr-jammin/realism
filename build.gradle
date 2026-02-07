@@ -1,20 +1,20 @@
 plugins {
-    id 'net.runelite.plugin' version '0.8.0'
+	id 'net.runelite.plugin' version '0.8.0'
 }
 
 group = 'com.realism'
 version = '1.0-SNAPSHOT'
 
 repositories {
-    mavenCentral()
+	mavenCentral()
 }
 
 dependencies {
-    compileOnly rootProject
-    annotationProcessor rootProject
-    testImplementation project(':runelite-client')
+	compileOnly rootProject
+	annotationProcessor rootProject
+	testImplementation project(':runelite-client')
 }
 
 tasks.named('shadowJar') {
-    archiveClassifier.set('')
+	archiveClassifier.set('')
 }

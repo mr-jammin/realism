@@ -1,4 +1,456 @@
+/*
+ * Copyright (c) 2026, mr-jammin
+ * All rights reserved.
+ * Licensed under BSD 2-Clause; see the LICENSE file.
+ */
 package com.realism;
+
+import com.google.common.collect.ImmutableSet;
+import com.google.inject.Provides;
+import java.awt.Color;
+import java.awt.image.BufferedImage;
+import java.util.Set;
+import javax.inject.Inject;
+import net.runelite.api.ChatMessageType;
+import net.runelite.api.Client;
+import net.runelite.api.GameState;
+import net.runelite.api.InventoryID;
+import net.runelite.api.ItemComposition;
+import net.runelite.api.ItemID;
+import net.runelite.api.MenuAction;
+import net.runelite.api.events.GameStateChanged;
+import net.runelite.api.events.GameTick;
+import net.runelite.api.events.ItemContainerChanged;
+import net.runelite.api.events.MenuOptionClicked;
+import net.runelite.client.Notifier;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.game.ItemManager;
+import net.runelite.client.game.ItemStats;
+import net.runelite.client.game.SpriteManager;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.ui.overlay.OverlayManager;
+import net.runelite.client.util.Text;
+
+@PluginDescriptor(
+	name = "Realism",
+	description = "Adds hunger, thirst and equipment durability meters with immersive orbs and restricts equipping broken items.",
+	tags = {"realism", "hunger", "thirst", "durability", "status", "orb"}
+)
+public class RealismPlugin extends Plugin
+{
+	private static final int TICKS_PER_MINUTE = 100;
+	private static final Set<String> EQUIP_OPTIONS = ImmutableSet.of("Wield", "Wear", "Equip", "Hold");
+	private static final Set<MenuAction> EQUIP_ACTIONS = ImmutableSet.of(MenuAction.CC_OP, MenuAction.CC_OP_LOW_PRIORITY);
+
+	@Inject
+	private Client client;
+	@Inject
+	private RealismConfig config;
+	@Inject
+	private ItemManager itemManager;
+	@Inject
+	private SpriteManager spriteManager;
+	@Inject
+	private OverlayManager overlayManager;
+	@Inject
+	private Notifier notifier;
+	@Inject
+	private RealismOrbOverlay orbOverlay;
+
+	private final MeterState hunger = new MeterState(100.0);
+	private final MeterState thirst = new MeterState(100.0);
+	private final DurabilityTracker durabilityTracker = new DurabilityTracker();
+	private final ConsumptionDetector consumptionDetector = new ConsumptionDetector();
+
+	private BufferedImage hungerIcon;
+	private BufferedImage thirstIcon;
+	private BufferedImage durabilityIcon;
+	private RealismConfig.HungerIcon cachedHungerIcon;
+	private boolean iconsDirty = true;
+
+	@Provides
+	RealismConfig provideConfig(ConfigManager configManager)
+	{
+		return configManager.getConfig(RealismConfig.class);
+	}
+
+	@Override
+	protected void startUp()
+	{
+		resetState();
+		updateInventorySnapshot();
+		updateEquipmentSnapshot();
+		overlayManager.add(orbOverlay);
+	}
+
+	@Override
+	protected void shutDown()
+	{
+		overlayManager.remove(orbOverlay);
+		resetState();
+		consumptionDetector.reset();
+		durabilityTracker.reset();
+		invalidateIcons();
+	}
+
+	@Subscribe
+	public void onConfigChanged(ConfigChanged event)
+	{
+		if ("realism".equals(event.getGroup()))
+		{
+			invalidateIcons();
+		}
+	}
+
+	@Subscribe
+	public void onGameTick(GameTick tick)
+	{
+		if (client.getGameState() != GameState.LOGGED_IN)
+		{
+			return;
+		}
+
+		hunger.drain(perTickLoss(config.hungerDrainRate()));
+		thirst.drain(perTickLoss(config.thirstDrainRate()));
+		durabilityTracker.drain(perTickLoss(config.durabilityDrainRate()));
+
+		checkHungerThresholds();
+		checkThirstThresholds();
+		checkDurabilityThresholds();
+	}
+
+	@Subscribe
+	public void onItemContainerChanged(ItemContainerChanged event)
+	{
+		int containerId = event.getContainerId();
+		if (containerId == InventoryID.INVENTORY.getId())
+		{
+			consumptionDetector.handleInventoryChange(event.getItemContainer(), this::handleItemConsumed);
+			return;
+		}
+
+		if (containerId == InventoryID.EQUIPMENT.getId())
+		{
+			durabilityTracker.handleEquipmentChange(event.getItemContainer());
+		}
+	}
+
+	@Subscribe
+	public void onMenuOptionClicked(MenuOptionClicked event)
+	{
+		if (!config.restrictBrokenEquip())
+		{
+			return;
+		}
+
+		String option = Text.removeTags(event.getMenuOption());
+		if (!EQUIP_OPTIONS.contains(option))
+		{
+			return;
+		}
+
+		if (!EQUIP_ACTIONS.contains(event.getMenuAction()))
+		{
+			return;
+		}
+
+		int itemId = event.getItemId();
+		if (itemId <= 0)
+		{
+			return;
+		}
+
+		Double durability = durabilityTracker.getDurability(itemId);
+		if (durability != null && durability <= 0.0)
+		{
+			event.consume();
+			sendMessage(config.durabilityBrokenMessage(), Color.RED);
+		}
+	}
+
+	@Subscribe
+	public void onGameStateChanged(GameStateChanged event)
+	{
+		if (event.getGameState() == GameState.LOGGED_IN)
+		{
+			resetState();
+			updateInventorySnapshot();
+			updateEquipmentSnapshot();
+		}
+	}
+
+	double getHunger()
+	{
+		return hunger.getValue();
+	}
+
+	double getThirst()
+	{
+		return thirst.getValue();
+	}
+
+	double getAverageDurability()
+	{
+		return durabilityTracker.getAverageDurability();
+	}
+
+	BufferedImage getIconForMeter(RealismOrbOverlay.MeterType type)
+	{
+		ensureIcons();
+		switch (type)
+		{
+			case HUNGER:
+				return hungerIcon;
+			case THIRST:
+				return thirstIcon;
+			case DURABILITY:
+				return durabilityIcon;
+			default:
+				return null;
+		}
+	}
+
+	Color getColourForMeter(RealismOrbOverlay.MeterType type)
+	{
+		switch (type)
+		{
+			case HUNGER:
+				return config.hungerColour();
+			case THIRST:
+				return config.thirstColour();
+			case DURABILITY:
+				return config.durabilityColour();
+			default:
+				return Color.WHITE;
+		}
+	}
+
+	private void resetState()
+	{
+		hunger.reset();
+		thirst.reset();
+		durabilityTracker.reset();
+	}
+
+	private void updateInventorySnapshot()
+	{
+		consumptionDetector.initializeSnapshot(client.getItemContainer(InventoryID.INVENTORY));
+	}
+
+	private void updateEquipmentSnapshot()
+	{
+		durabilityTracker.handleEquipmentChange(client.getItemContainer(InventoryID.EQUIPMENT));
+	}
+
+	private void handleItemConsumed(int itemId, int count)
+	{
+		ItemStats stats = itemManager.getItemStats(itemId, false);
+		int healAmount = stats != null ? Math.max(0, stats.getHeal()) : 0;
+		if (healAmount > 0)
+		{
+			double restore = healAmount * config.foodHealWeight() * count;
+			hunger.restore(restore);
+		}
+
+		ItemComposition comp = itemManager.getItemComposition(itemId);
+		if (comp != null)
+		{
+			String name = Text.removeTags(comp.getName()).toLowerCase();
+			if (isBeverage(name))
+			{
+				int restore = config.potionRestore() * count;
+				thirst.restore(restore);
+			}
+		}
+	}
+
+	private boolean isBeverage(String name)
+	{
+		return name.contains("potion")
+			|| name.contains("brew")
+			|| name.contains("rum")
+			|| name.contains("ale")
+			|| name.contains("beer")
+			|| name.contains("wine")
+			|| name.contains("cider")
+			|| name.contains("milk")
+			|| name.contains("tea")
+			|| name.contains("water")
+			|| name.contains("coffee")
+			|| name.contains("gourd")
+			|| name.contains("jug")
+			|| name.contains("flask")
+			|| name.contains("waterskin");
+	}
+
+	private void checkHungerThresholds()
+	{
+		checkMeterThresholds(
+			hunger,
+			config.hungerLowThreshold(),
+			config.hungerLowMessage(),
+			config.hungerCriticalMessage(),
+			Color.ORANGE,
+			Color.RED,
+			config.notifyHunger()
+		);
+	}
+
+	private void checkThirstThresholds()
+	{
+		checkMeterThresholds(
+			thirst,
+			config.thirstLowThreshold(),
+			config.thirstLowMessage(),
+			config.thirstCriticalMessage(),
+			Color.CYAN,
+			Color.RED,
+			config.notifyThirst()
+		);
+	}
+
+	private void checkMeterThresholds(
+		MeterState meter,
+		int lowThreshold,
+		String lowMessage,
+		String criticalMessage,
+		Color lowColour,
+		Color criticalColour,
+		boolean notifyDesktop
+	)
+	{
+		double value = meter.getValue();
+		if (value <= 0.0)
+		{
+			if (!meter.isCritSent())
+			{
+				sendMessage(criticalMessage, criticalColour);
+				if (notifyDesktop)
+				{
+					notifier.notify(criticalMessage);
+				}
+				meter.setCritSent(true);
+				meter.setLowSent(true);
+			}
+			return;
+		}
+
+		if (value <= lowThreshold)
+		{
+			if (!meter.isLowSent())
+			{
+				sendMessage(lowMessage, lowColour);
+				if (notifyDesktop)
+				{
+					notifier.notify(lowMessage);
+				}
+				meter.setLowSent(true);
+			}
+			meter.setCritSent(false);
+			return;
+		}
+
+		meter.setLowSent(false);
+		meter.setCritSent(false);
+	}
+
+	private void checkDurabilityThresholds()
+	{
+		double minDurability = durabilityTracker.getMinimumDurability();
+		int lowThreshold = config.durabilityLowThreshold();
+		if (minDurability <= 0.0)
+		{
+			if (!durabilityTracker.isCritSent())
+			{
+				sendMessage(config.durabilityBrokenMessage(), Color.RED);
+				if (config.notifyDurability())
+				{
+					notifier.notify(config.durabilityBrokenMessage());
+				}
+				durabilityTracker.setCritSent(true);
+				durabilityTracker.setLowSent(true);
+			}
+			return;
+		}
+
+		if (minDurability <= lowThreshold)
+		{
+			if (!durabilityTracker.isLowSent())
+			{
+				sendMessage(config.durabilityLowMessage(), Color.YELLOW);
+				if (config.notifyDurability())
+				{
+					notifier.notify(config.durabilityLowMessage());
+				}
+				durabilityTracker.setLowSent(true);
+			}
+			durabilityTracker.setCritSent(false);
+			return;
+		}
+
+		durabilityTracker.setLowSent(false);
+		durabilityTracker.setCritSent(false);
+	}
+
+	private void sendMessage(String message, Color colour)
+	{
+		String colourTag = String.format("<col=%06x>", colour.getRGB() & 0xFFFFFF);
+		client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", colourTag + message, null);
+	}
+
+	private double perTickLoss(int drainMinutes)
+	{
+		if (drainMinutes <= 0)
+		{
+			return 0.0;
+		}
+		return 100.0 / (drainMinutes * (double) TICKS_PER_MINUTE);
+	}
+
+	private void ensureIcons()
+	{
+		RealismConfig.HungerIcon iconSetting = config.hungerIcon();
+		if (iconsDirty || hungerIcon == null || cachedHungerIcon != iconSetting)
+		{
+			cachedHungerIcon = iconSetting;
+			int itemId;
+			switch (iconSetting)
+			{
+				case FISH:
+					itemId = ItemID.TROUT;
+					break;
+				case CABBAGE:
+					itemId = ItemID.CABBAGE;
+					break;
+				case MEAT:
+				default:
+					itemId = ItemID.COOKED_MEAT;
+					break;
+			}
+			hungerIcon = spriteManager.getSprite(itemId, 0);
+		}
+
+		if (iconsDirty || thirstIcon == null)
+		{
+			thirstIcon = spriteManager.getSprite(ItemID.VIAL_OF_WATER, 0);
+		}
+
+		if (iconsDirty || durabilityIcon == null)
+		{
+			durabilityIcon = spriteManager.getSprite(ItemID.IRON_FULL_HELM, 0);
+		}
+
+		iconsDirty = hungerIcon == null || thirstIcon == null || durabilityIcon == null;
+	}
+
+	private void invalidateIcons()
+	{
+		iconsDirty = true;
+	}
+}package com.realism;
 
 import com.google.common.collect.ImmutableSet;
 import com.google.inject.Provides;

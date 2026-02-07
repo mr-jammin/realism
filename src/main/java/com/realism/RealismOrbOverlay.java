@@ -1,4 +1,143 @@
+/*
+ * Copyright (c) 2026, mr-jammin
+ * All rights reserved.
+ * Licensed under BSD 2-Clause; see the LICENSE file.
+ */
 package com.realism;
+
+import java.awt.Color;
+import java.awt.Dimension;
+import java.awt.Graphics2D;
+import java.awt.RenderingHints;
+import java.awt.image.BufferedImage;
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import net.runelite.client.ui.overlay.Overlay;
+import net.runelite.client.ui.overlay.OverlayLayer;
+import net.runelite.client.ui.overlay.OverlayPosition;
+import net.runelite.client.ui.overlay.OverlayPriority;
+
+@Singleton
+public class RealismOrbOverlay extends Overlay
+{
+	public enum MeterType
+	{
+		HUNGER,
+		THIRST,
+		DURABILITY
+	}
+
+	private static final int ORB_SIZE = 36;
+	private static final int ICON_SIZE = 18;
+	private static final int GAP = 8;
+	private static final MeterType[] METERS = {MeterType.HUNGER, MeterType.THIRST, MeterType.DURABILITY};
+
+	private final RealismPlugin plugin;
+	private final RealismConfig config;
+
+	@Inject
+	public RealismOrbOverlay(RealismPlugin plugin, RealismConfig config)
+	{
+		this.plugin = plugin;
+		this.config = config;
+		setPosition(OverlayPosition.TOP_LEFT);
+		setPriority(OverlayPriority.HIGH);
+		setLayer(OverlayLayer.ABOVE_SCENE);
+		setMovable(true);
+	}
+
+	@Override
+	public Dimension render(Graphics2D graphics)
+	{
+		int x = 0;
+		int drawn = 0;
+
+		Object oldAntialias = graphics.getRenderingHint(RenderingHints.KEY_ANTIALIASING);
+		graphics.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+
+		for (MeterType type : METERS)
+		{
+			if (!shouldDraw(type))
+			{
+				continue;
+			}
+			double value = getValueForMeter(type);
+			Color colour = plugin.getColourForMeter(type);
+			BufferedImage icon = plugin.getIconForMeter(type);
+			drawOrb(graphics, x, 0, value, colour, icon);
+			x += ORB_SIZE + GAP;
+			drawn++;
+		}
+
+		graphics.setRenderingHint(RenderingHints.KEY_ANTIALIASING, oldAntialias);
+
+		int width = drawn * ORB_SIZE + Math.max(0, drawn - 1) * GAP;
+		return new Dimension(width, ORB_SIZE);
+	}
+
+	private boolean shouldDraw(MeterType type)
+	{
+		switch (type)
+		{
+			case HUNGER:
+				return config.showHunger();
+			case THIRST:
+				return config.showThirst();
+			case DURABILITY:
+				return config.showDurability();
+			default:
+				return false;
+		}
+	}
+
+	private double getValueForMeter(MeterType type)
+	{
+		switch (type)
+		{
+			case HUNGER:
+				return plugin.getHunger();
+			case THIRST:
+				return plugin.getThirst();
+			case DURABILITY:
+				return plugin.getAverageDurability();
+			default:
+				return 100.0;
+		}
+	}
+
+	private void drawOrb(Graphics2D g, int x, int y, double value, Color colour, BufferedImage icon)
+	{
+		double fraction = Math.max(0.0, Math.min(1.0, value / 100.0));
+		Color background = new Color(0, 0, 0, 100);
+		Color fill = new Color(colour.getRed(), colour.getGreen(), colour.getBlue(), 180);
+
+		g.setColor(background);
+		g.fillOval(x, y, ORB_SIZE, ORB_SIZE);
+
+		g.setColor(fill);
+		int startAngle = 90;
+		int arcAngle = (int) -(360 * fraction);
+		g.fillArc(x, y, ORB_SIZE, ORB_SIZE, startAngle, arcAngle);
+
+		g.setColor(Color.BLACK);
+		g.drawOval(x, y, ORB_SIZE, ORB_SIZE);
+
+		if (icon != null)
+		{
+			int ix = x + (ORB_SIZE - ICON_SIZE) / 2;
+			int iy = y + (ORB_SIZE - ICON_SIZE) / 2;
+			g.drawImage(icon, ix, iy, ICON_SIZE, ICON_SIZE, null);
+		}
+
+		String text = String.format("%d%%", (int) Math.round(value));
+		g.setColor(Color.WHITE);
+		g.setFont(g.getFont().deriveFont(10f));
+		int textWidth = g.getFontMetrics().stringWidth(text);
+		int tx = x + (ORB_SIZE - textWidth) / 2;
+		int ty = y + ORB_SIZE + 12;
+		g.drawString(text, tx, ty);
+	}
+}package com.realism;
 
 import java.awt.Color;
 import java.awt.Dimension;
